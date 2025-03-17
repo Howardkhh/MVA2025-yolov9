@@ -99,6 +99,7 @@ def create_dataloader(path,
                       imgsz,
                       batch_size,
                       stride,
+                      inference,
                       single_cls=False,
                       hyp=None,
                       augment=False,
@@ -119,6 +120,7 @@ def create_dataloader(path,
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabels(
             path,
+            inference,
             imgsz,
             batch_size,
             augment=augment,  # augmentation
@@ -434,6 +436,7 @@ class LoadImagesAndLabels(Dataset):
 
     def __init__(self,
                  path,
+                 inference,
                  img_size=640,
                  batch_size=16,
                  augment=False,
@@ -446,11 +449,12 @@ class LoadImagesAndLabels(Dataset):
                  pad=0.0,
                  min_items=0,
                  prefix=''):
+        self.inference = inference
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
-        self.rect = False if image_weights else rect
+        self.rect = False if image_weights or hyp["sahi"] else rect
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
@@ -519,6 +523,20 @@ class LoadImagesAndLabels(Dataset):
 
         # Create indices
         n = len(self.shapes)  # number of images
+        if self.hyp["sahi"]:
+            sahi_n = 0
+            fi = [] # full image index
+            for i, (x, y) in enumerate(self.shapes):
+                # if self.inference:
+                #     num_crops = math.ceil(x / self.img_size) * math.ceil(y / self.img_size)
+                # else:
+                #     num_crops = 1
+                num_crops = 1 # faster validation
+                sahi_n += num_crops
+                for j in range(num_crops):
+                    fi.append([i, j])
+            n = sahi_n
+            self.fi = np.array(fi)
         bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
@@ -565,6 +583,10 @@ class LoadImagesAndLabels(Dataset):
         # Cache images into RAM/disk for faster training
         if cache_images == 'ram' and not self.check_cache_ram(prefix=prefix):
             cache_images = False
+        if cache_images and self.hyp["sahi"]:
+            cache_images = False
+            LOGGER.warning('WARNING ⚠️ --cache is incompatible with SAHI training/inferencing, setting cache=False')
+
         self.ims = [None] * n
         self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files]
         if cache_images:
@@ -638,7 +660,7 @@ class LoadImagesAndLabels(Dataset):
         return x
 
     def __len__(self):
-        return len(self.im_files)
+        return self.n # len(self.im_files)
 
     # def __iter__(self):
     #     self.count = -1
@@ -662,14 +684,18 @@ class LoadImagesAndLabels(Dataset):
 
         else:
             # Load image
-            img, (h0, w0), (h, w) = self.load_image(index)
+            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
+            if self.hyp["sahi"]:
+                index, _ = self.fi[index] # full image index, crop index
             labels = self.labels[index].copy()
+            if self.hyp["sahi"]:
+                labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
             if labels.size:  # normalized xywh to pixel xyxy format
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
@@ -718,10 +744,57 @@ class LoadImagesAndLabels(Dataset):
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
+        if self.hyp["sahi"]:
+            index, _ = self.fi[index] # full image index, crop index
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+
+    def get_crop_coordinates(self, y0, x0, n):
+        x = y = self.img_size
+        # Number of patches along each axis
+        nx = math.ceil(x0 / x)
+        ny = math.ceil(y0 / y)
+
+        # Calculate overlaps if needed
+        overlap_x = (nx * x - x0) / (nx - 1) if nx > 1 else 0
+        overlap_y = (ny * y - y0) / (ny - 1) if ny > 1 else 0
+
+        # Determine row and column index of the nth patch
+        i = n % nx  # Column index
+        j = n // nx  # Row index
+
+        # Compute start coordinates
+        x_start = math.floor(i * (x - overlap_x))
+        y_start = math.floor(j * (y - overlap_y))
+
+        # Compute end coordinates
+        x_end = x_start + x
+        y_end = y_start + y
+
+        return x_start, x_end, y_start, y_end
+
+    def map_label_to_crop(self, labels, w0, h0, x_range, y_range): # label: cxcywh, range: start, end
+        mapped_labels = []
+        for label in labels:
+            cls, cx, cy, w, h = label
+            x1, x2, y1, y2 = w0 * (cx - w / 2), w0 * (cx + w / 2), h0 * (cy - h / 2), h0 * (cy + h / 2)
+            if x2 < x_range[0] or x1 > x_range[1] or y2 < y_range[0] or y1 > y_range[1]:
+                continue
+            x1 = max(x1, x_range[0])
+            x2 = min(x2, x_range[1])
+            y1 = max(y1, y_range[0])
+            y2 = min(y2, y_range[1])
+            x1, x2, y1,  y2 = x1 - x_range[0], x2 - x_range[0], y1 - y_range[0], y2 - y_range[0]
+            mapped_labels.append([cls, (x1 + x2) / 2 / (x_range[1] - x_range[0]), (y1 + y2) / 2 / (y_range[1] - y_range[0]), (x2 - x1) / (x_range[1] - x_range[0]), (y2 - y1) / (y_range[1] - y_range[0])])
+        if len(mapped_labels) == 0:
+            return np.ndarray((0, 5))
+        return np.array(mapped_labels)
+
 
     def load_image(self, i):
         # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
+        if self.hyp["sahi"]:
+            i, j = self.fi[i] # full image index, crop index
+
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
@@ -729,13 +802,25 @@ class LoadImagesAndLabels(Dataset):
             else:  # read image
                 im = cv2.imread(f)  # BGR
                 assert im is not None, f'Image Not Found {f}'
+
+            if self.hyp["sahi"]:
+                h0, w0 = im.shape[:2]  # orig hw
+                # if self.inference:
+                #     x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], j)
+                #     im = im[y_start:y_end, x_start:x_end]
+                # else:
+                x_start, y_start = random.randint(0, im.shape[1] - self.img_size), random.randint(0, im.shape[0] - self.img_size)
+                x_end, y_end = x_start + self.img_size, y_start + self.img_size
+                im = im[y_start:y_end, x_start:x_end]
+                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
+
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
             if r != 1:  # if sizes are not equal
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
                 im = cv2.resize(im, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
-        return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
+            return im, (h0, w0), im.shape[:2], ((0, w0), (0, h0))  # im, hw_original, hw_resized
+        return self.ims[i], self.im_hw0[i], self.im_hw[i], ((0, self.im_hw0[i][1]), (0, self.im_hw0[i][0]))  # im, hw_original, hw_resized
 
     def cache_images_to_disk(self, i):
         # Saves an image as an *.npy file for faster loading
@@ -752,7 +837,7 @@ class LoadImagesAndLabels(Dataset):
         random.shuffle(indices)
         for i, index in enumerate(indices):
             # Load image
-            img, _, (h, w) = self.load_image(index)
+            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
 
             # place img in img4
             if i == 0:  # top left
@@ -774,7 +859,11 @@ class LoadImagesAndLabels(Dataset):
             padh = y1a - y1b
 
             # Labels
+            if self.hyp["sahi"]:
+                index, _ = self.fi[index] # full image index, crop index
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if self.hyp["sahi"]:
+                labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
                 segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
@@ -810,7 +899,7 @@ class LoadImagesAndLabels(Dataset):
         hp, wp = -1, -1  # height, width previous
         for i, index in enumerate(indices):
             # Load image
-            img, _, (h, w) = self.load_image(index)
+            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
 
             # place img in img9
             if i == 0:  # center
@@ -838,7 +927,11 @@ class LoadImagesAndLabels(Dataset):
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coords
 
             # Labels
+            if self.hyp["sahi"]:
+                index, _ = self.fi[index] # full image index, crop index
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if self.hyp["sahi"]:
+                labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format
                 segments = [xyn2xy(x, w, h, padx, pady) for x in segments]
