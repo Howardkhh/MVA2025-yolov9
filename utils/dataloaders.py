@@ -99,7 +99,7 @@ def create_dataloader(path,
                       imgsz,
                       batch_size,
                       stride,
-                      inference,
+                      sahi='none',
                       single_cls=False,
                       hyp=None,
                       augment=False,
@@ -117,10 +117,13 @@ def create_dataloader(path,
     if rect and shuffle:
         LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
+    if augment and sahi=='sahi':
+        LOGGER.warning("WARNING ⚠️ --sahi sahi is incompatible with augmentations, setting sahi=\'none\'")
+        sahi = 'none'
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabels(
             path,
-            inference,
+            sahi,
             imgsz,
             batch_size,
             augment=augment,  # augmentation
@@ -436,7 +439,7 @@ class LoadImagesAndLabels(Dataset):
 
     def __init__(self,
                  path,
-                 inference,
+                 sahi,
                  img_size=640,
                  batch_size=16,
                  augment=False,
@@ -449,12 +452,13 @@ class LoadImagesAndLabels(Dataset):
                  pad=0.0,
                  min_items=0,
                  prefix=''):
-        self.inference = inference
+        self.sahi = sahi
+        self.sahi_crop = sahi=='crop' or (hyp is not None and hyp["sahi"])
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
-        self.rect = False if image_weights or hyp["sahi"] else rect
+        self.rect = False if image_weights or (hyp is not None and hyp["sahi"]) else rect
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
@@ -523,25 +527,18 @@ class LoadImagesAndLabels(Dataset):
 
         # Create indices
         n = len(self.shapes)  # number of images
-        if self.hyp["sahi"]:
-            sahi_n = 0
+        if self.sahi:
             fi = [] # full image index
             for i, (x, y) in enumerate(self.shapes):
-                # if self.inference:
-                #     num_crops = math.ceil(x / self.img_size) * math.ceil(y / self.img_size)
-                # else:
-                #     num_crops = 1
-                num_crops = 1 # faster validation
-                sahi_n += num_crops
-                for j in range(num_crops):
-                    fi.append([i, j])
-            n = sahi_n
+                num_crops = math.ceil(x / self.img_size) * math.ceil(y / self.img_size)
+                fi.append([i, num_crops])
             self.fi = np.array(fi)
         bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
-        self.indices = range(n)
+        self.indices = list(range(n))
+        # random.shuffle(self.indices) # for fast debugging
 
         # Update labels
         include_class = []  # filter labels to include only these classes (optional)
@@ -579,11 +576,13 @@ class LoadImagesAndLabels(Dataset):
                     shapes[i] = [1, 1 / mini]
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
+            if self.sahi != 'none':
+                self.batch_shapes = [[img_size, img_size]] * nb
 
         # Cache images into RAM/disk for faster training
         if cache_images == 'ram' and not self.check_cache_ram(prefix=prefix):
             cache_images = False
-        if cache_images and self.hyp["sahi"]:
+        if cache_images and self.sahi_crop:
             cache_images = False
             LOGGER.warning('WARNING ⚠️ --cache is incompatible with SAHI training/inferencing, setting cache=False')
 
@@ -660,6 +659,7 @@ class LoadImagesAndLabels(Dataset):
         return x
 
     def __len__(self):
+        # return 100 # for fast debugging
         return self.n # len(self.im_files)
 
     # def __iter__(self):
@@ -683,30 +683,46 @@ class LoadImagesAndLabels(Dataset):
                 img, labels = mixup(img, labels, *self.load_mosaic(random.randint(0, self.n - 1)))
 
         else:
-            # Load image
-            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+            if self.sahi == "sahi":
+                index, num_crops = self.fi[index] # full image index, crop index
+                images, startends = [], []
+                for i in range(num_crops):
+                    image, (h0, w0), _, startend = self.load_image(index, i)
+                    images.append(image.transpose((2, 0, 1))[::-1])
+                    startends.append(np.array(startend))
+                images = torch.from_numpy(np.ascontiguousarray(np.stack(images)))
+                labels = self.labels[index].copy()
+                if labels.size:  # normalized xywh to pixel xyxy format
+                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w0, h0)
+                    labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w0, h0, clip=True, eps=1E-3)
+                labels_out = torch.zeros((len(labels), 6))
+                if len(labels):
+                    labels_out[:, 1:] = torch.from_numpy(labels)
+                return images, labels_out, self.im_files[index], startends
 
-            # Letterbox
-            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            else:
+                # Load image
 
-            if self.hyp["sahi"]:
-                index, _ = self.fi[index] # full image index, crop index
-            labels = self.labels[index].copy()
-            if self.hyp["sahi"]:
-                labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+                # Letterbox
+                shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+                img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+                shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
-            if self.augment:
-                img, labels = random_perspective(img,
-                                                 labels,
-                                                 degrees=hyp['degrees'],
-                                                 translate=hyp['translate'],
-                                                 scale=hyp['scale'],
-                                                 shear=hyp['shear'],
-                                                 perspective=hyp['perspective'])
+                labels = self.labels[index].copy()
+                if self.sahi_crop:
+                    labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
+                if labels.size:  # normalized xywh to pixel xyxy format
+                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+                if self.augment:
+                    img, labels = random_perspective(img,
+                                                    labels,
+                                                    degrees=hyp['degrees'],
+                                                    translate=hyp['translate'],
+                                                    scale=hyp['scale'],
+                                                    shear=hyp['shear'],
+                                                    perspective=hyp['perspective'])
 
         nl = len(labels)  # number of labels
         if nl:
@@ -744,8 +760,6 @@ class LoadImagesAndLabels(Dataset):
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
-        if self.hyp["sahi"]:
-            index, _ = self.fi[index] # full image index, crop index
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
     def get_crop_coordinates(self, y0, x0, n):
@@ -790,11 +804,8 @@ class LoadImagesAndLabels(Dataset):
         return np.array(mapped_labels)
 
 
-    def load_image(self, i):
+    def load_image(self, i, sahi_j=-1):
         # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
-        if self.hyp["sahi"]:
-            i, j = self.fi[i] # full image index, crop index
-
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
@@ -803,16 +814,17 @@ class LoadImagesAndLabels(Dataset):
                 im = cv2.imread(f)  # BGR
                 assert im is not None, f'Image Not Found {f}'
 
-            if self.hyp["sahi"]:
-                h0, w0 = im.shape[:2]  # orig hw
-                # if self.inference:
-                #     x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], j)
-                #     im = im[y_start:y_end, x_start:x_end]
-                # else:
+            if self.sahi_crop:
+                h0, w0 = im.shape[:2] # orig hw
                 x_start, y_start = random.randint(0, im.shape[1] - self.img_size), random.randint(0, im.shape[0] - self.img_size)
                 x_end, y_end = x_start + self.img_size, y_start + self.img_size
                 im = im[y_start:y_end, x_start:x_end]
                 return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
+            if sahi_j != -1:
+                h0, w0 = im.shape[:2] # orig hw
+                x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], sahi_j)
+                im = im[y_start:y_end, x_start:x_end]
+                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))
 
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
@@ -859,10 +871,8 @@ class LoadImagesAndLabels(Dataset):
             padh = y1a - y1b
 
             # Labels
-            if self.hyp["sahi"]:
-                index, _ = self.fi[index] # full image index, crop index
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
-            if self.hyp["sahi"]:
+            if self.sahi_crop:
                 labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
@@ -927,10 +937,8 @@ class LoadImagesAndLabels(Dataset):
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coords
 
             # Labels
-            if self.hyp["sahi"]:
-                index, _ = self.fi[index] # full image index, crop index
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
-            if self.hyp["sahi"]:
+            if self.sahi_crop:
                 labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format

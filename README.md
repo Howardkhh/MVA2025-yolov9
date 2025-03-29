@@ -1,3 +1,41 @@
+# Usages modified for MVA2025
+
+## Prepare YOLO data format
+[Source](https://github.com/ultralytics/JSON2YOLO)
+```bash
+cd JSON2YOLO & python general_json2yolo.py
+mv JSON2YOLO/SMOT4SB datasets
+cd datasets/SMOT4SB/images
+# link image dirs to OC_SORT dir, modify to suit your needs
+ln -s ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/train train
+ln -s ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/val val
+ln -s ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/pub_test pub_test
+```
+
+## Train with sahi
+```bash
+python -m torch.distributed.launch --nproc_per_node 2 --master_port 9527 train_dual.py --workers 2 --device 0,1 --sync-bn --batch 24 --data data/mva2025.yaml --img 640 --cfg models/detect/yolov9-e-mva2025.yaml --weights weights/yolov9-e.pt --name yolov9-e --hyp hyp.scratch-high-sahi.yaml --min-items 0 --epochs 500 --close-mosaic 15
+```
+
+## Validation on val
+```bash
+python val_dual.py --data data/mva2025.yaml --img 640 --batch 32 --conf 0.001 --iou 0.7 --device 0 --weights runs/train/yolov9-e-mva-sahi/weights/last.pt --save-json --name yolov9-e-mva-sahi-sahi --sahi sahi
+```
+--sahi modes:
+1. 'none': inference with full resolution images.
+2. 'crop': inference with cropped image (640x640 here). Metrics calculated on cropped images.
+3. 'sahi': inference with cropped image, the results are concatenated together. Metrics are calculated on full images.
+
+Validation may take hours to run. Uncomment these two lines in `utils/dataloaders` for fast debugging (you can directly search `fast debugging`)
+1. LoadImagesAndLabels.__init__(): random.shuffle(self.indices)
+2. LoadImagesAndLabels.__len__(): return 100 
+
+## Inference for pub_test
+```bash
+python val_dual.py --data data/mva2025.yaml --img 640 --batch 32 --conf 0.001 --iou 0.7 --device 0 --weights runs/train/yolov9-e-mva-sahi/weights/last.pt --save-json --name yolov9-e-mva-sahi-sahi --sahi sahi --task test --project runs/pub_test
+```
+
+
 # YOLOv9
 
 Implementation of paper - [YOLOv9: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)

@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLO root directory
@@ -35,9 +37,17 @@ def save_one_txt(predn, save_conf, shape, file):
             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
 
-def save_one_json(predn, jdict, path, class_map):
+def save_one_json(predn, jdict, path, class_map, ann_coco: COCO):
     # Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    # image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+
+    ######### Customized for MVA2025 dataset #########
+    image_name = str(Path(*path.parts[-2:]))
+    for img in ann_coco.dataset['images']:
+        if img['file_name'] == image_name:
+            image_id = img['id']
+    ######### Customized for MVA2025 dataset #########
+
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
@@ -98,6 +108,7 @@ def run(
         half=True,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         min_items=0,  # Experimental
+        sahi='none',  # use sahi inference
         model=None,
         dataloader=None,
         save_dir=Path(''),
@@ -130,6 +141,9 @@ def run(
             if not (pt or jit):
                 batch_size = 1  # export.py models default to batch-size 1
                 LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models')
+        if sahi == "sahi":
+            batch_size = 1
+            LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for sahi inference')
 
         # Data
         data = check_dataset(data)  # check
@@ -156,7 +170,8 @@ def run(
                                        imgsz,
                                        batch_size,
                                        stride,
-                                       single_cls,
+                                       sahi,
+                                       single_cls=single_cls,
                                        pad=pad,
                                        rect=rect,
                                        workers=workers,
@@ -168,27 +183,58 @@ def run(
     names = model.names if hasattr(model, 'names') else model.module.names  # get class names
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
-    class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
+    class_map = coco80_to_coco91_class() if is_coco else list(range(1, 1001)) # 0-index to 1-index (Customized for MVA2025 dataset)
     s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
+    ann_coco = COCO(str(Path(data.get('path', '../coco')) / f'annotations/{"pub_test" if task=="test" else task}.json'))
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s)  # progress bar
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+        if sahi == 'sahi': # remap variables
+            ims = im[0]
+            startends = shapes[0]
         callbacks.run('on_val_batch_start')
         with dt[0]:
-            if cuda:
-                im = im.to(device, non_blocking=True)
-                targets = targets.to(device)
-            im = im.half() if half else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            nb, _, height, width = im.shape  # batch size, channels, height, width
+            if sahi == 'sahi':
+                if cuda:
+                    ims = ims.to(device, non_blocking=True)
+                    targets = targets.to(device)
+                ims = ims.half() if half else ims.float()
+                ims /= 255
+                width = max([x[0, 1] for x in startends])
+                height = max([y[1, 1] for y in startends])
+                im = torch.empty((1, 3, height, width), device=device, dtype=torch.half if half else float)
+                shapes = [[[height, width], [[1, 1], [0, 0]]]]
+            else:
+                if cuda:
+                    im = im.to(device, non_blocking=True)
+                    targets = targets.to(device)
+                im = im.half() if half else im.float()  # uint8 to fp16/32
+                im /= 255  # 0 - 255 to 0.0 - 1.0
+                nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            if sahi == 'sahi':
+                preds = [[[], []]]
+                all_crop_preds, train_out = model(ims) if compute_loss else (model(ims, augment=augment), None) # crop_preds = ((inference, training), 2, nb, (xywh, cls0, ...), N_predictions)
+                for i in range(len(ims)):
+                    im_crop = ims[i:i+1]
+                    startend = startends[i]
+                    im[:, :, startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop
+                    xyxy_start = torch.tensor([startend[0, 0], startend[1, 0]], device=device).unsqueeze(0).unsqueeze(2)
+                    pred_0, pred_1 = all_crop_preds[0][0][i:i+1], all_crop_preds[0][1][i:i+1]
+                    pred_0[:, :2] = (pred_0[:, :2] + xyxy_start)
+                    pred_1[:, :2] = (pred_1[:, :2] + xyxy_start)
+                    preds[0][0].append(pred_0)
+                    preds[0][1].append(pred_1)
+                preds[0][0] = torch.cat(preds[0][0], dim=-1)
+                preds[0][1] = torch.cat(preds[0][1], dim=-1)
+            else:
+                preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
 
         # Loss
         if compute_loss:
@@ -245,11 +291,11 @@ def run(
             if save_txt:
                 save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
             if save_json:
-                save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
+                save_one_json(predn, jdict, path, class_map, ann_coco)  # append to COCO-JSON dictionary
             callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
 
         # Plot images
-        if plots and batch_i < 3:
+        if plots and batch_i < 100:
             plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
             plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
@@ -288,18 +334,27 @@ def run(
     # Save JSON
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
+        anno_json = str(Path(data.get('path', '../coco')) / 'annotations/val.json')  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
         LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
         with open(pred_json, 'w') as f:
             json.dump(jdict, f)
 
         try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            check_requirements('pycocotools')
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
-
             anno = COCO(anno_json)  # init annotations api
+
+            ######### Customized for faster validation with partial dataset #########
+            anno.dataset['images'] = [
+                img for img in anno.dataset['images']
+                if any(img['id'] == pred_img['image_id'] for pred_img in jdict)
+            ]
+            anno.dataset['annotations'] = [
+                ann for ann in anno.dataset['annotations']
+                if any(ann['image_id'] == pred_img['image_id'] for pred_img in jdict)
+            ]
+            anno.createIndex()
+            ######### Customized for faster validation with partial dataset #########
+
             pred = anno.loadRes(pred_json)  # init predictions api
             eval = COCOeval(anno, pred, 'bbox')
             if is_coco:
@@ -347,6 +402,7 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
+    parser.add_argument('--sahi', type=str, choices=['none', 'crop', 'sahi'], default="none", help="use sahi inference, choices: none, crop, sahi")
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
