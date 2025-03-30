@@ -3,13 +3,17 @@
 ## Prepare YOLO data format
 [Source](https://github.com/ultralytics/JSON2YOLO)
 ```bash
-cd JSON2YOLO & python general_json2yolo.py
-mv JSON2YOLO/SMOT4SB datasets
+cd JSON2YOLO && python general_json2yolo.py && cd ..
+mkdir -p datasets/SMOT4SB && mv JSON2YOLO/SMOT4SB datasets/
 cd datasets/SMOT4SB/images
 # link image dirs to OC_SORT dir, modify to suit your needs
 ln -s ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/train train
 ln -s ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/val val
 ln -s ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/pub_test pub_test
+# copy COCO annotations
+cd ..
+cp -r ~/MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/annotations/ .
+cd ../..
 ```
 
 ## Train with sahi

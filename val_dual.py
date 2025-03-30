@@ -226,12 +226,13 @@ def run(
                     startend = startends[i]
                     im[:, :, startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop
                     xyxy_start = torch.tensor([startend[0, 0], startend[1, 0]], device=device).unsqueeze(0).unsqueeze(2)
-                    pred_0, pred_1 = all_crop_preds[0][0][i:i+1], all_crop_preds[0][1][i:i+1]
-                    pred_0[:, :2] = (pred_0[:, :2] + xyxy_start)
+                    # pred_0, pred_1 = all_crop_preds[0][0][i:i+1], all_crop_preds[0][1][i:i+1]
+                    pred_1 = all_crop_preds[0][1][i:i+1]
+                    # pred_0[:, :2] = (pred_0[:, :2] + xyxy_start)
                     pred_1[:, :2] = (pred_1[:, :2] + xyxy_start)
-                    preds[0][0].append(pred_0)
+                    # preds[0][0].append(pred_0)
                     preds[0][1].append(pred_1)
-                preds[0][0] = torch.cat(preds[0][0], dim=-1)
+                # preds[0][0] = torch.cat(preds[0][0], dim=-1)
                 preds[0][1] = torch.cat(preds[0][1], dim=-1)
             else:
                 preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
@@ -344,15 +345,15 @@ def run(
             anno = COCO(anno_json)  # init annotations api
 
             ######### Customized for faster validation with partial dataset #########
-            anno.dataset['images'] = [
-                img for img in anno.dataset['images']
-                if any(img['id'] == pred_img['image_id'] for pred_img in jdict)
-            ]
-            anno.dataset['annotations'] = [
-                ann for ann in anno.dataset['annotations']
-                if any(ann['image_id'] == pred_img['image_id'] for pred_img in jdict)
-            ]
-            anno.createIndex()
+            # anno.dataset['images'] = [
+            #     img for img in anno.dataset['images']
+            #     if any(img['id'] == pred_img['image_id'] for pred_img in jdict)
+            # ]
+            # anno.dataset['annotations'] = [
+            #     ann for ann in anno.dataset['annotations']
+            #     if any(ann['image_id'] == pred_img['image_id'] for pred_img in jdict)
+            # ]
+            # anno.createIndex()
             ######### Customized for faster validation with partial dataset #########
 
             pred = anno.loadRes(pred_json)  # init predictions api

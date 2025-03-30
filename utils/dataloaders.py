@@ -529,9 +529,9 @@ class LoadImagesAndLabels(Dataset):
         n = len(self.shapes)  # number of images
         if self.sahi:
             fi = [] # full image index
-            for i, (x, y) in enumerate(self.shapes):
+            for x, y in self.shapes:
                 num_crops = math.ceil(x / self.img_size) * math.ceil(y / self.img_size)
-                fi.append([i, num_crops])
+                fi.append(num_crops)
             self.fi = np.array(fi)
         bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
         nb = bi[-1] + 1  # number of batches
@@ -563,6 +563,7 @@ class LoadImagesAndLabels(Dataset):
             self.labels = [self.labels[i] for i in irect]
             self.segments = [self.segments[i] for i in irect]
             self.shapes = s[irect]  # wh
+            self.fi = self.fi[irect]
             ar = ar[irect]
 
             # Set training image shapes
@@ -684,7 +685,7 @@ class LoadImagesAndLabels(Dataset):
 
         else:
             if self.sahi == "sahi":
-                index, num_crops = self.fi[index] # full image index, crop index
+                num_crops = self.fi[index] # full image index, crop index
                 images, startends = [], []
                 for i in range(num_crops):
                     image, (h0, w0), _, startend = self.load_image(index, i)
