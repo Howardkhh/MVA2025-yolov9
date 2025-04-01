@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.general import xywh2xyxy
-from utils.metrics import bbox_iou
+from utils.metrics import bbox_iou, bbox_nwd
 from utils.tal.anchor_generator import dist2bbox, make_anchors, bbox2dist
 from utils.tal.assigner import TaskAlignedAssigner
 from utils.torch_utils import de_parallel
@@ -60,10 +60,11 @@ class FocalLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    def __init__(self, reg_max, use_dfl=False):
+    def __init__(self, reg_max, use_dfl=False, use_nwd=False):
         super().__init__()
         self.reg_max = reg_max
         self.use_dfl = use_dfl
+        self.use_nwd=False
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
         # iou loss
@@ -72,7 +73,10 @@ class BboxLoss(nn.Module):
         target_bboxes_pos = torch.masked_select(target_bboxes, bbox_mask).view(-1, 4)
         bbox_weight = torch.masked_select(target_scores.sum(-1), fg_mask).unsqueeze(-1)
         
-        iou = bbox_iou(pred_bboxes_pos, target_bboxes_pos, xywh=False, CIoU=True)
+        if self.use_nwd:
+            iou = bbox_nwd(pred_bboxes_pos, target_bboxes_pos, xywh=False)
+        else:
+            iou = bbox_iou(pred_bboxes_pos, target_bboxes_pos, xywh=False, CIoU=True)
         loss_iou = 1.0 - iou
 
         loss_iou *= bbox_weight
@@ -105,7 +109,7 @@ class BboxLoss(nn.Module):
 
 class ComputeLoss:
     # Compute losses
-    def __init__(self, model, use_dfl=True):
+    def __init__(self, model, use_dfl=True, use_nwd_ass=False, use_nwd_loss=False):
         device = next(model.parameters()).device  # get model device
         h = model.hyp  # hyperparameters
 
@@ -134,13 +138,15 @@ class ComputeLoss:
         self.assigner = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
                                             num_classes=self.nc,
                                             alpha=float(os.getenv('YOLOA', 0.5)),
-                                            beta=float(os.getenv('YOLOB', 6.0)))
+                                            beta=float(os.getenv('YOLOB', 6.0)),
+                                            use_nwd=use_nwd_ass)
         self.assigner2 = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
                                             num_classes=self.nc,
                                             alpha=float(os.getenv('YOLOA', 0.5)),
-                                            beta=float(os.getenv('YOLOB', 6.0)))
-        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
-        self.bbox_loss2 = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
+                                            beta=float(os.getenv('YOLOB', 6.0)),
+                                            use_nwd=use_nwd_ass)
+        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=use_dfl, use_nwd=use_nwd_loss).to(device)
+        self.bbox_loss2 = BboxLoss(m.reg_max - 1, use_dfl=use_dfl, use_nwd=use_nwd_loss).to(device)
         self.proj = torch.arange(m.reg_max).float().to(device)  # / 120.0
         self.use_dfl = use_dfl
 
