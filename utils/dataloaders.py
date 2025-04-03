@@ -798,7 +798,7 @@ class LoadImagesAndLabels(Dataset):
             x2 = min(x2, x_range[1])
             y1 = max(y1, y_range[0])
             y2 = min(y2, y_range[1])
-            x1, x2, y1,  y2 = x1 - x_range[0], x2 - x_range[0], y1 - y_range[0], y2 - y_range[0]
+            x1, x2, y1, y2 = x1 - x_range[0], x2 - x_range[0], y1 - y_range[0], y2 - y_range[0]
             mapped_labels.append([cls, (x1 + x2) / 2 / (x_range[1] - x_range[0]), (y1 + y2) / 2 / (y_range[1] - y_range[0]), (x2 - x1) / (x_range[1] - x_range[0]), (y2 - y1) / (y_range[1] - y_range[0])])
         if len(mapped_labels) == 0:
             return np.ndarray((0, 5))

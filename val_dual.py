@@ -188,7 +188,7 @@ def run(
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
     loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
+    jdict, jdict_no_nms, stats, ap, ap_class = [], [], [], [], []
     ann_coco = COCO(str(Path(data.get('path', '../coco')) / f'annotations/{"pub_test" if task=="test" else task}.json'))
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s)  # progress bar
@@ -220,14 +220,14 @@ def run(
         with dt[1]:
             if sahi == 'sahi':
                 preds = [[[], []]]
-                all_crop_preds, train_out = model(ims) if compute_loss else (model(ims, augment=augment), None) # crop_preds = ((inference, training), 2, nb, (xywh, cls0, ...), N_predictions)
                 for i in range(len(ims)):
+                    crop_preds, train_out = model(ims[i:i+1]) if compute_loss else (model(ims[i:i+1], augment=augment), None) # crop_preds = ((inference, training), 2, nb, (xywh, cls0, ...), N_predictions)
                     im_crop = ims[i:i+1]
                     startend = startends[i]
                     im[:, :, startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop
                     xyxy_start = torch.tensor([startend[0, 0], startend[1, 0]], device=device).unsqueeze(0).unsqueeze(2)
                     # pred_0, pred_1 = all_crop_preds[0][0][i:i+1], all_crop_preds[0][1][i:i+1]
-                    pred_1 = all_crop_preds[0][1][i:i+1]
+                    pred_1 = crop_preds[0][1]
                     # pred_0[:, :2] = (pred_0[:, :2] + xyxy_start)
                     pred_1[:, :2] = (pred_1[:, :2] + xyxy_start)
                     # preds[0][0].append(pred_0)
@@ -249,6 +249,7 @@ def run(
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         with dt[2]:
+            ori_preds = preds.clone().detach()
             preds = non_max_suppression(preds,
                                         conf_thres,
                                         iou_thres,
@@ -256,6 +257,14 @@ def run(
                                         multi_label=True,
                                         agnostic=single_cls,
                                         max_det=max_det)
+            preds_no_nms = non_max_suppression(ori_preds,
+                                        conf_thres,
+                                        iou_thres,
+                                        labels=lb,
+                                        multi_label=True,
+                                        agnostic=single_cls,
+                                        max_det=max_det,
+                                        do_nms=False)
 
         # Metrics
         for si, pred in enumerate(preds):
@@ -294,6 +303,27 @@ def run(
             if save_json:
                 save_one_json(predn, jdict, path, class_map, ann_coco)  # append to COCO-JSON dictionary
             callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
+        for si, pred in enumerate(preds_no_nms):
+            labels = targets[targets[:, 0] == si, 1:]
+            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
+            path, shape = Path(paths[si]), shapes[si][0]
+            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
+            seen += 1
+
+            if npr == 0:
+                continue
+
+            # Predictions
+            if single_cls:
+                pred[:, 5] = 0
+            predn = pred.clone()
+            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            
+            # Save/log
+            if save_txt:
+                save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
+            if save_json:
+                save_one_json(predn, jdict_no_nms, path, class_map, ann_coco)  # append to COCO-JSON dictionary
 
         # Plot images
         if plots and batch_i < 100:
@@ -337,9 +367,12 @@ def run(
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = str(Path(data.get('path', '../coco')) / 'annotations/val.json')  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
+        pred_no_nms_json = str(save_dir / f"{w}_predictions_no_nms.json")  # predictions json
         LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
         with open(pred_json, 'w') as f:
             json.dump(jdict, f)
+        with open(pred_no_nms_json, 'w') as f:
+            json.dump(jdict_no_nms, f)
 
         try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
             anno = COCO(anno_json)  # init annotations api
@@ -386,7 +419,7 @@ def parse_opt():
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.7, help='NMS IoU threshold')
-    parser.add_argument('--max-det', type=int, default=300, help='maximum detections per image')
+    parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')

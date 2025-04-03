@@ -244,7 +244,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None):
     if isinstance(targets, torch.Tensor):
         targets = targets.cpu().numpy()
 
-    max_size = 1920  # max image size
+    max_size = 3840  # max image size
     max_subplots = 16  # max image subplots, i.e. 4x4
     bs, _, h, w = images.shape  # batch size, _, height, width
     bs = min(bs, max_subplots)  # limit plot images
@@ -270,7 +270,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None):
 
     # Annotate
     fs = int((h + w) * ns * 0.01)  # font size
-    annotator = Annotator(mosaic, line_width=round(fs / 10), font_size=fs, pil=True, example=names)
+    annotator = Annotator(mosaic, line_width=1, font_size=2, pil=True, example=names)
     for i in range(i + 1):
         x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
         annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
@@ -298,7 +298,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None):
                 if labels or conf[j] > 0.25:  # 0.25 conf thresh
                     label = f'{cls}' if labels else f'{cls} {conf[j]:.1f}'
                     annotator.box_label(box, label, color=color)
-    annotator.im.save(fname)  # save
+    annotator.im.save(fname, subsampling=0, quality=100)  # save
 
 
 def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
