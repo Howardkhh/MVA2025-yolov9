@@ -44,6 +44,39 @@ for orientation in ExifTags.TAGS.keys():
         break
 
 
+def prepare_4ch_for_model(img4ch):
+    assert img4ch.shape[2] == 4, "Image must have 4 channels"
+
+    rgb = img4ch[..., :3]       # (H, W, 3)
+    diff = img4ch[..., 3:]      # (H, W, 1)
+
+    rgb = rgb[:, :, ::-1]       # RGB → BGR
+    img_combined = np.concatenate([rgb, diff], axis=2)  # (H, W, 4)
+    img_combined = img_combined.transpose(2, 0, 1)       # (4, H, W)
+
+    return img_combined
+
+def save_rgb_and_diff(img4ch: np.ndarray, rgb_path: str, diff_path: str):
+    assert img4ch.ndim == 3 and img4ch.shape[2] == 4, "Expected image of shape (H, W, 4)"
+
+    rgb = img4ch[..., :3]
+    diff = img4ch[..., 3]
+
+    # Convert to uint8 if needed
+    if rgb.max() <= 1.0:
+        rgb = (rgb * 255).astype(np.uint8)
+    else:
+        rgb = rgb.astype(np.uint8)
+
+    if diff.max() <= 1.0:
+        diff = (diff * 255).astype(np.uint8)
+    else:
+        diff = diff.astype(np.uint8)
+
+    # Save using OpenCV (BGR for RGB image)
+    cv2.imwrite(rgb_path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(diff_path, diff)
+
 def get_hash(paths):
     # Returns a single hash value of a list of paths (files or dirs)
     size = sum(os.path.getsize(p) for p in paths if os.path.exists(p))  # sizes
@@ -676,6 +709,7 @@ class LoadImagesAndLabels(Dataset):
         mosaic = self.mosaic and random.random() < hyp['mosaic']
         if mosaic:
             # Load mosaic
+
             img, labels = self.load_mosaic(index)
             shapes = None
 
@@ -684,12 +718,17 @@ class LoadImagesAndLabels(Dataset):
                 img, labels = mixup(img, labels, *self.load_mosaic(random.randint(0, self.n - 1)))
 
         else:
+            
             if self.sahi == "sahi":
                 num_crops = self.fi[index] # full image index, crop index
                 images, startends = [], []
                 for i in range(num_crops):
-                    image, (h0, w0), _, startend = self.load_image(index, i)
-                    images.append(image.transpose((2, 0, 1))[::-1])
+                    image, diff_img, (h0, w0), _, startend = self.load_image(index, i)
+                    
+                    # images.append(image.transpose((2, 0, 1))[::-1])
+                    diff_img = np.expand_dims(diff_img, axis=-1)
+                    image = np.concatenate([image.astype(np.float32), diff_img.astype(np.float32)], axis=2)
+                    images.append(prepare_4ch_for_model(image))
                     startends.append(np.array(startend))
                 images = torch.from_numpy(np.ascontiguousarray(np.stack(images)))
                 labels = self.labels[index].copy()
@@ -703,8 +742,11 @@ class LoadImagesAndLabels(Dataset):
 
             else:
                 # Load image
+                img, diff_img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
 
-                img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+                diff_img = np.expand_dims(diff_img, axis=-1)
+                img = np.concatenate([img.astype(np.float32), diff_img.astype(np.float32)], axis=2)
+
                 # Letterbox
                 shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
                 img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
@@ -731,9 +773,14 @@ class LoadImagesAndLabels(Dataset):
 
         if self.augment:
             # Albumentations
-            img, labels = self.albumentations(img, labels)
-            nl = len(labels)  # update after albumentations
 
+            rgb, diff = img[..., :3], img[..., 3:]
+            # img, labels = self.albumentations(img, labels)
+            rgb_aug, labels = self.albumentations(rgb, labels)
+            img = np.concatenate([rgb_aug, diff], axis=-1)
+            
+            nl = len(labels)  # update after albumentations
+            
             # HSV color-space
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
@@ -748,7 +795,7 @@ class LoadImagesAndLabels(Dataset):
                 img = np.fliplr(img)
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
-
+            
             # Cutouts
             # labels = cutout(img, labels, p=0.5)
             # nl = len(labels)  # update after cutout
@@ -756,9 +803,9 @@ class LoadImagesAndLabels(Dataset):
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
-
         # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        # img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = prepare_4ch_for_model(img)
         img = np.ascontiguousarray(img)
 
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
@@ -807,7 +854,10 @@ class LoadImagesAndLabels(Dataset):
 
     def load_image(self, i, sahi_j=-1):
         # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
+        diff_root_path = '/home/muyishen2040/mva2025/diff_maps/'
+        
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
+
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
                 im = np.load(fn)
@@ -815,24 +865,41 @@ class LoadImagesAndLabels(Dataset):
                 im = cv2.imread(f)  # BGR
                 assert im is not None, f'Image Not Found {f}'
 
+            diff_f = diff_root_path + '/'.join(f.split('/')[-3:])
+            diff_im = cv2.imread(diff_f)
+            assert diff_im is not None, f'Diff Image Not Found {diff_f}'
+
+            if diff_im.shape[:2] != im.shape[:2]:
+                diff_im = cv2.resize(diff_im, (im.shape[1], im.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+            diff_im = diff_im[:, :, 0]
+            # diff_im = diff_im.astype(np.float32) / 255.0
+
             if self.sahi_crop:
                 h0, w0 = im.shape[:2] # orig hw
                 x_start, y_start = random.randint(0, im.shape[1] - self.img_size), random.randint(0, im.shape[0] - self.img_size)
                 x_end, y_end = x_start + self.img_size, y_start + self.img_size
                 im = im[y_start:y_end, x_start:x_end]
-                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
+
+                diff_im = diff_im[y_start:y_end, x_start:x_end]
+
+                return im, diff_im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
             if sahi_j != -1:
                 h0, w0 = im.shape[:2] # orig hw
                 x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], sahi_j)
                 im = im[y_start:y_end, x_start:x_end]
-                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))
+
+                diff_im = diff_im[y_start:y_end, x_start:x_end]
+                return im, diff_im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))
 
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
             if r != 1:  # if sizes are not equal
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
                 im = cv2.resize(im, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            return im, (h0, w0), im.shape[:2], ((0, w0), (0, h0))  # im, hw_original, hw_resized
+                diff_im = cv2.resize(diff_im, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            return im, diff_im, (h0, w0), im.shape[:2], ((0, w0), (0, h0))  # im, hw_original, hw_resized
+        
         return self.ims[i], self.im_hw0[i], self.im_hw[i], ((0, self.im_hw0[i][1]), (0, self.im_hw0[i][0]))  # im, hw_original, hw_resized
 
     def cache_images_to_disk(self, i):
@@ -850,7 +917,11 @@ class LoadImagesAndLabels(Dataset):
         random.shuffle(indices)
         for i, index in enumerate(indices):
             # Load image
-            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+            img, diff_img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+            
+            diff_img = np.expand_dims(diff_img, axis=-1)
+            img = np.concatenate([img.astype(np.float32), diff_img.astype(np.float32)], axis=2)
+
 
             # place img in img4
             if i == 0:  # top left
@@ -889,6 +960,7 @@ class LoadImagesAndLabels(Dataset):
 
         # Augment
         img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp['copy_paste'])
+
         img4, labels4 = random_perspective(img4,
                                            labels4,
                                            segments4,
@@ -910,7 +982,7 @@ class LoadImagesAndLabels(Dataset):
         hp, wp = -1, -1  # height, width previous
         for i, index in enumerate(indices):
             # Load image
-            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+            img, diff_img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
 
             # place img in img9
             if i == 0:  # center
