@@ -140,10 +140,10 @@ def run(
             device = model.device
             if not (pt or jit):
                 batch_size = 1  # export.py models default to batch-size 1
-                LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models')
+                LOGGER.info(f'Forcing --batch-size 1 square inference (1,4,{imgsz},{imgsz}) for non-PyTorch models')
         if sahi == "sahi":
             batch_size = 1
-            LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for sahi inference')
+            LOGGER.info(f'Forcing --batch-size 1 square inference (1,4,{imgsz},{imgsz}) for sahi inference')
 
         # Data
         data = check_dataset(data)  # check
@@ -163,7 +163,7 @@ def run(
             ncm = model.model.nc
             assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
                               f'classes). Pass correct combination of --weights and --data that are trained together.'
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        model.warmup(imgsz=(1 if pt else batch_size, 4, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task],
@@ -192,12 +192,19 @@ def run(
     ann_coco = COCO(str(Path(data.get('path', '../coco')) / f'annotations/{"pub_test" if task=="test" else task}.json'))
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s)  # progress bar
+    import pdb
+
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+        # pdb.set_trace()
+
         if sahi == 'sahi': # remap variables
             ims = im[0]
             startends = shapes[0]
         callbacks.run('on_val_batch_start')
         with dt[0]:
+            
+            # pdb.set_trace()
+
             if sahi == 'sahi':
                 if cuda:
                     ims = ims.to(device, non_blocking=True)
@@ -206,7 +213,7 @@ def run(
                 ims /= 255
                 width = max([x[0, 1] for x in startends])
                 height = max([y[1, 1] for y in startends])
-                im = torch.empty((1, 3, height, width), device=device, dtype=torch.half if half else float)
+                im = torch.empty((1, 4, height, width), device=device, dtype=torch.half if half else float)
                 shapes = [[[height, width], [[1, 1], [0, 0]]]]
             else:
                 if cuda:
@@ -216,6 +223,7 @@ def run(
                 im /= 255  # 0 - 255 to 0.0 - 1.0
                 nb, _, height, width = im.shape  # batch size, channels, height, width
 
+        # pdb.set_trace()
         # Inference
         with dt[1]:
             if sahi == 'sahi':
