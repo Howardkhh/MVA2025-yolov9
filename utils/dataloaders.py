@@ -113,7 +113,8 @@ def create_dataloader(path,
                       quad=False,
                       min_items=0,
                       prefix='',
-                      shuffle=False):
+                      shuffle=False,
+                      stack_frame=None):
     if rect and shuffle:
         LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
@@ -135,7 +136,8 @@ def create_dataloader(path,
             pad=pad,
             image_weights=image_weights,
             min_items=min_items,
-            prefix=prefix)
+            prefix=prefix,
+            stack_frame=stack_frame)
 
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
@@ -451,7 +453,8 @@ class LoadImagesAndLabels(Dataset):
                  stride=32,
                  pad=0.0,
                  min_items=0,
-                 prefix=''):
+                 prefix='',
+                 stack_frame=[0]):
         self.sahi = sahi
         self.sahi_crop = sahi=='crop' or (hyp is not None and hyp["sahi"])
         self.img_size = img_size
@@ -464,6 +467,8 @@ class LoadImagesAndLabels(Dataset):
         self.stride = stride
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
+        self.stack_frame = [0]
+        self.stack_frame.extend([i for i in stack_frame if i != 0])
 
         try:
             f = []  # image files
@@ -481,6 +486,21 @@ class LoadImagesAndLabels(Dataset):
                 else:
                     raise FileNotFoundError(f'{prefix}{p} does not exist')
             self.im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+            video_len = {}
+            for im_file in self.im_files:
+                video_id, image_id = im_file.split(os.sep)[-2:]
+                video_len[video_id] = video_len.get(video_id, 0) + 1
+            self.im_files_stack = []
+            for im_file in self.im_files:
+                self.im_files_stack.append([])
+                im_path = Path(im_file)
+                path, video_id, image_id = im_path.parent.parent, im_path.parent.name, im_path.name
+                image_id = int(image_id.split('.')[0])
+                for i in self.stack_frame:
+                    stack_id = image_id + i
+                    stack_id = max(1, min(stack_id, video_len[video_id]))
+                    stack_id = str(stack_id).zfill(5)
+                    self.im_files_stack[-1].append(str(path / video_id / f'{stack_id}.jpg'))
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
             assert self.im_files, f'{prefix}No images found'
         except Exception as e:
@@ -559,6 +579,7 @@ class LoadImagesAndLabels(Dataset):
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             irect = ar.argsort()
             self.im_files = [self.im_files[i] for i in irect]
+            self.im_files_stacked = [self.im_files_stacked[i] for i in irect]
             self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.segments = [self.segments[i] for i in irect]
@@ -603,6 +624,9 @@ class LoadImagesAndLabels(Dataset):
                     b += self.ims[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({b / gb:.1f}GB {cache_images})'
             pbar.close()
+        
+        for idx, im_file_stack in enumerate(self.im_files_stack):
+            assert im_file_stack[0] == self.im_files[idx], f"Stacked image {im_file_stack[0]} does not match original image {self.im_files[idx]}"
 
     def check_cache_ram(self, safety_margin=0.1, prefix=''):
         # Check image caching requirements vs available memory
@@ -807,13 +831,21 @@ class LoadImagesAndLabels(Dataset):
 
     def load_image(self, i, sahi_j=-1):
         # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
-        im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
+        # im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
+        im = None # does not support RAM caching for now
         if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
-                im = np.load(fn)
-            else:  # read image
-                im = cv2.imread(f)  # BGR
-                assert im is not None, f'Image Not Found {f}'
+            # if fn.exists():  # load npy
+            #     im = np.load(fn)
+            # else:  # read image
+            #     im = cv2.imread(f)  # BGR
+            #     assert im is not None, f'Image Not Found {f}'
+
+            ims = []
+            for im_file in self.im_files_stack[i]:
+                im = cv2.imread(im_file)  # BGR
+                assert im is not None, f'Image Not Found {im_file}'
+                ims.append(im)
+            im = np.concatenate(ims, axis=2)
 
             if self.sahi_crop:
                 h0, w0 = im.shape[:2] # orig hw

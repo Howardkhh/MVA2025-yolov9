@@ -42,8 +42,11 @@ class Albumentations:
 
     def __call__(self, im, labels, p=1.0):
         if self.transform and random.random() < p:
-            new = self.transform(image=im, bboxes=labels[:, 1:], class_labels=labels[:, 0])  # transformed
-            im, labels = new['image'], np.array([[c, *b] for c, b in zip(new['class_labels'], new['bboxes'])])
+            assert im.shape[2] % 3 == 0
+            for i in range(0, im.shape[2], 3):
+                new = self.transform(image=im[..., i:i+3], bboxes=labels[:, 1:], class_labels=labels[:, 0])  # transformed
+                im[..., i:i+3] = new['image']
+            labels = np.array([[c, *b] for c, b in zip(new['class_labels'], new['bboxes'])])
         return im, labels
 
 
@@ -62,17 +65,18 @@ def denormalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD):
 def augment_hsv(im, hgain=0.5, sgain=0.5, vgain=0.5):
     # HSV color-space augmentation
     if hgain or sgain or vgain:
-        r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
-        hue, sat, val = cv2.split(cv2.cvtColor(im, cv2.COLOR_BGR2HSV))
-        dtype = im.dtype  # uint8
+        for i in range(0, im.shape[2], 3):
+            r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
+            hue, sat, val = cv2.split(cv2.cvtColor(im[..., i:i + 3], cv2.COLOR_BGR2HSV))
+            dtype = im.dtype  # uint8
 
-        x = np.arange(0, 256, dtype=r.dtype)
-        lut_hue = ((x * r[0]) % 180).astype(dtype)
-        lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
-        lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+            x = np.arange(0, 256, dtype=r.dtype)
+            lut_hue = ((x * r[0]) % 180).astype(dtype)
+            lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+            lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
 
-        im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
-        cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=im)  # no return needed
+            im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+            im[..., i:i + 3] = cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR)  # no return needed
 
 
 def hist_equalize(im, clahe=True, bgr=False):

@@ -224,7 +224,7 @@ def run(
                     crop_preds, train_out = model(ims[i:i+1]) if compute_loss else (model(ims[i:i+1], augment=augment), None) # crop_preds = ((inference, training), 2, nb, (xywh, cls0, ...), N_predictions)
                     im_crop = ims[i:i+1]
                     startend = startends[i]
-                    im[:, :, startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop
+                    im[:, :3, startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop
                     xyxy_start = torch.tensor([startend[0, 0], startend[1, 0]], device=device).unsqueeze(0).unsqueeze(2)
                     # pred_0, pred_1 = all_crop_preds[0][0][i:i+1], all_crop_preds[0][1][i:i+1]
                     pred_1 = crop_preds[0][1]
