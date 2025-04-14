@@ -22,6 +22,7 @@ import yaml
 from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
+import pyvips
 
 from utils.augmentations import (Albumentations, augment_hsv, classify_albumentations, classify_transforms, copy_paste,
                                  letterbox, mixup, random_perspective)
@@ -830,6 +831,13 @@ class LoadImagesAndLabels(Dataset):
 
 
     def load_image(self, i, sahi_j=-1):
+        def load_crop(data):
+            im_file, x_start, y_start = data
+            im = pyvips.Image.new_from_file(im_file, access="sequential")
+            assert im is not None, f'Image Not Found {im_file}'
+            im = im.crop(x_start, y_start, self.img_size, self.img_size).copy_memory().numpy()[..., ::-1]
+            return im
+            
         # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
         # im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i],
         im = None # does not support RAM caching for now
@@ -840,24 +848,21 @@ class LoadImagesAndLabels(Dataset):
             #     im = cv2.imread(f)  # BGR
             #     assert im is not None, f'Image Not Found {f}'
 
-            ims = []
-            for im_file in self.im_files_stack[i]:
-                im = cv2.imread(im_file)  # BGR
-                assert im is not None, f'Image Not Found {im_file}'
-                ims.append(im)
-            im = np.concatenate(ims, axis=2)
-
+            im = pyvips.Image.new_from_file(self.im_files_stack[i][0], access="sequential")
+            h0, w0 = im.height, im.width # orig hw
             if self.sahi_crop:
-                h0, w0 = im.shape[:2] # orig hw
-                x_start, y_start = random.randint(0, im.shape[1] - self.img_size), random.randint(0, im.shape[0] - self.img_size)
+                x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
                 x_end, y_end = x_start + self.img_size, y_start + self.img_size
-                im = im[y_start:y_end, x_start:x_end]
-                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
             if sahi_j != -1:
-                h0, w0 = im.shape[:2] # orig hw
                 x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], sahi_j)
-                im = im[y_start:y_end, x_start:x_end]
-                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))
+            results = ThreadPool(NUM_THREADS).map(load_crop, [[im_file, x_start, y_start] for im_file in self.im_files_stack[i]])
+            # results = [load_crop((im_file, x_start, y_start)) for im_file in self.im_files_stack[i]]
+            im = np.ndarray((self.img_size, self.img_size, len(self.im_files_stack[i]) * 3), dtype=np.uint8)
+            for i, ims in enumerate(results):
+                im[:, :, i*3:i*3 + 3] = ims
+            return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
+
+            raise NotImplementedError()
 
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
