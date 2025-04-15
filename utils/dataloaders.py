@@ -22,7 +22,6 @@ import yaml
 from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
-import pyvips
 
 from utils.augmentations import (Albumentations, augment_hsv, classify_albumentations, classify_transforms, copy_paste,
                                  letterbox, mixup, random_perspective)
@@ -833,9 +832,9 @@ class LoadImagesAndLabels(Dataset):
     def load_image(self, i, sahi_j=-1):
         def load_crop(data):
             im_file, x_start, y_start = data
-            im = pyvips.Image.new_from_file(im_file, access="sequential")
+            im = cv2.imread(im_file)
             assert im is not None, f'Image Not Found {im_file}'
-            im = im.crop(x_start, y_start, self.img_size, self.img_size).copy_memory().numpy()[..., ::-1]
+            im = im[y_start:y_start + self.img_size, x_start:x_start + self.img_size]
             return im
             
         # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
@@ -848,23 +847,30 @@ class LoadImagesAndLabels(Dataset):
             #     im = cv2.imread(f)  # BGR
             #     assert im is not None, f'Image Not Found {f}'
 
-            im = pyvips.Image.new_from_file(self.im_files_stack[i][0], access="sequential")
-            h0, w0 = im.height, im.width # orig hw
-            if self.sahi_crop:
-                x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
-                x_end, y_end = x_start + self.img_size, y_start + self.img_size
-            if sahi_j != -1:
-                x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], sahi_j)
-            results = ThreadPool(NUM_THREADS).map(load_crop, [[im_file, x_start, y_start] for im_file in self.im_files_stack[i]])
-            # results = [load_crop((im_file, x_start, y_start)) for im_file in self.im_files_stack[i]]
-            im = np.ndarray((self.img_size, self.img_size, len(self.im_files_stack[i]) * 3), dtype=np.uint8)
-            for i, ims in enumerate(results):
-                im[:, :, i*3:i*3 + 3] = ims
-            return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
-
-            raise NotImplementedError()
-
-            h0, w0 = im.shape[:2]  # orig hw
+            im = Image.open(self.im_files_stack[i][0])
+            im.verify()  # PIL verify
+            w0, h0  = exif_size(im)  # image size
+            if self.sahi_crop or sahi_j != -1:
+                if self.sahi_crop:
+                    x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
+                    x_end, y_end = x_start + self.img_size, y_start + self.img_size
+                elif sahi_j != -1:
+                    x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], sahi_j)
+                ims = ThreadPool(NUM_THREADS).map(load_crop, [[im_file, x_start, y_start] for im_file in self.im_files_stack[i]])
+                # ims = [load_crop((im_file, x_start, y_start)) for im_file in self.im_files_stack[i]]
+                im = np.ndarray((self.img_size, self.img_size, len(self.im_files_stack[i]) * 3), dtype=np.uint8)
+                for i, im_slice in enumerate(ims):
+                    im[:, :, i*3:i*3 + 3] = im_slice
+                return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
+            
+            ims = []
+            for im_file in self.im_files_stack[i]:
+                im = cv2.imread(im_file)  # BGR
+                assert im is not None, f'Image Not Found {im_file}'
+                ims.append(im)
+            im = np.ndarray((h0, w0, len(self.im_files_stack[i]) * 3), dtype=np.uint8)
+            for i, im_slice in enumerate(ims):
+                im[:, :, i*3:i*3 + 3] = im_slice
             r = self.img_size / max(h0, w0)  # ratio
             if r != 1:  # if sizes are not equal
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
