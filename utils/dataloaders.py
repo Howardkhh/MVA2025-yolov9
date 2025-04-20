@@ -519,6 +519,9 @@ class LoadImagesAndLabels(Dataset):
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\n{HELP_URL}') from e
 
+
+        
+
         # Check cache
         self.label_files = img2label_paths(self.im_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
@@ -571,7 +574,7 @@ class LoadImagesAndLabels(Dataset):
         self.batch = bi  # batch index of image
         self.n = n
         self.indices = list(range(n))
-        # random.shuffle(self.indices) # for fast debugging
+        random.shuffle(self.indices) # for fast debugging
 
         # Update labels
         include_class = []  # filter labels to include only these classes (optional)
@@ -636,6 +639,23 @@ class LoadImagesAndLabels(Dataset):
                     b += self.ims[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({b / gb:.1f}GB {cache_images})'
             pbar.close()
+        
+        import pandas as pd
+        perf_path = "/home/muyishen2040/mva2025/sorted_output.txt"
+        perf_df = pd.read_csv(perf_path)
+
+        # Map image to F1 score
+        f1_map = {k.replace('/', os.sep): v for k, v in zip(perf_df['image_name'], perf_df['f1_score'])}
+
+        # Match order of self.im_files and get corresponding F1 scores
+        f1_scores = np.array([f1_map.get(f, 1.0) for f in self.im_files])  # default to 1.0 if not found
+
+        # Invert scores to make worse images more likely (avoid div by zero)
+        eps = 1e-6
+        sampling_scores = np.clip(1.0 / (f1_scores + eps), 1, 3)
+
+        # Normalize to make a probability distribution
+        self.sampling_probs = sampling_scores / sampling_scores.sum()
 
     def check_cache_ram(self, safety_margin=0.1, prefix=''):
         # Check image caching requirements vs available memory
@@ -693,7 +713,7 @@ class LoadImagesAndLabels(Dataset):
         return x
 
     def __len__(self):
-        # return 100 # for fast debugging
+        # return 10 # for fast debugging
         return self.n # len(self.im_files)
 
     # def __iter__(self):
@@ -703,7 +723,8 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
-        index = self.indices[index]  # linear, shuffled, or image_weights
+        # index = self.indices[index]  # linear, shuffled, or image_weights
+        index = np.random.choice(self.n, p=self.sampling_probs)
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
@@ -774,15 +795,17 @@ class LoadImagesAndLabels(Dataset):
         if self.augment:
             # Albumentations
 
-            rgb, diff = img[..., :3], img[..., 3:]
+            # rgb, diff = img[..., :3], img[..., 3:]
             # img, labels = self.albumentations(img, labels)
-            rgb_aug, labels = self.albumentations(rgb, labels)
-            img = np.concatenate([rgb_aug, diff], axis=-1)
+            # rgb_aug, labels = self.albumentations(rgb, labels)
+            
             
             nl = len(labels)  # update after albumentations
             
             # HSV color-space
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+            # augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            # img = np.concatenate([rgb, diff], axis=-1)
 
             # Flip up-down
             if random.random() < hyp['flipud']:

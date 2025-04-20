@@ -194,6 +194,8 @@ def run(
     pbar = tqdm(dataloader, desc=s)  # progress bar
     import pdb
 
+    per_image_stats = {}
+
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         # pdb.set_trace()
 
@@ -305,6 +307,15 @@ def run(
                     confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
 
+            
+            image_key = '/'.join(str(path).split('/')[-3:])
+            per_image_stats[image_key] = (
+                correct[:, 0].cpu(),  # Only AP@0.5
+                pred[:, 4].cpu(),     # conf
+                pred[:, 5].cpu(),     # pred class
+                labels[:, 0].cpu()    # true class
+            )
+
             # Save/log
             if save_txt:
                 save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
@@ -334,7 +345,8 @@ def run(
                 save_one_json(predn, jdict_no_nms, path, class_map, ann_coco)  # append to COCO-JSON dictionary
 
         # Plot images
-        if plots and batch_i < 100:
+        # if plots and batch_i < 100:
+        if plots and batch_i > 600 and batch_i < 1000 and (batch_i % 5 ==0):
             plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
             plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
@@ -347,6 +359,45 @@ def run(
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
+
+    output_txt = save_dir / "per_image_metrics.txt"
+    with open(output_txt, "w") as f:
+        header = "image_name,num_gts,num_preds,precision,recall,AP@0.5\n"
+        f.write(header)
+        for k, (correct, conf, pcls, tcls) in per_image_stats.items():
+            correct = correct.numpy()
+            conf = conf.numpy()
+            pcls = pcls.numpy()
+            tcls = tcls.numpy()
+            
+            num_preds = len(pcls)
+            num_gts = len(tcls)
+            
+            # Skip images with no GTs or no preds
+            if num_gts == 0 and num_preds == 0:
+                precision = recall = 0.0
+            elif num_preds == 0:
+                precision = 0.0
+                recall = 0.0
+
+            elif num_gts == 0:
+                precision = 0.0
+                recall = 0.0
+
+            else:
+                tp = correct.astype(bool)
+                fp = ~tp
+                tp_sum = tp.sum()
+                fp_sum = fp.sum()
+
+                precision = tp_sum / (tp_sum + fp_sum + 1e-16)
+                recall = tp_sum / (num_gts + 1e-16)
+
+                # approximate AP@0.5 as area under PR curve (simple 2-point trapezoid)
+
+            f.write(f"{k},{num_gts},{num_preds},{precision:.4f},{recall:.4f}\n")
+            # break
+    
 
     # Print results
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
