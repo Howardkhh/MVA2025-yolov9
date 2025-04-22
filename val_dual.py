@@ -109,6 +109,7 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         min_items=0,  # Experimental
         sahi='none',  # use sahi inference
+        stack_frame=[0],
         model=None,
         dataloader=None,
         save_dir=Path(''),
@@ -163,7 +164,7 @@ def run(
             ncm = model.model.nc
             assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
                               f'classes). Pass correct combination of --weights and --data that are trained together.'
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        model.warmup(imgsz=(1 if pt else batch_size, 3*len(stack_frame), imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task],
@@ -176,7 +177,8 @@ def run(
                                        rect=rect,
                                        workers=workers,
                                        min_items=opt.min_items,
-                                       prefix=colorstr(f'{task}: '))[0]
+                                       prefix=colorstr(f'{task}: '),
+                                       stack_frame=stack_frame)[0]
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -224,7 +226,7 @@ def run(
                     crop_preds, train_out = model(ims[i:i+1]) if compute_loss else (model(ims[i:i+1], augment=augment), None) # crop_preds = ((inference, training), 2, nb, (xywh, cls0, ...), N_predictions)
                     im_crop = ims[i:i+1]
                     startend = startends[i]
-                    im[:, :3, startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop
+                    im[..., startend[1, 0]:startend[1, 1], startend[0, 0]:startend[0, 1]] = im_crop[:, -3:]
                     xyxy_start = torch.tensor([startend[0, 0], startend[1, 0]], device=device).unsqueeze(0).unsqueeze(2)
                     # pred_0, pred_1 = all_crop_preds[0][0][i:i+1], all_crop_preds[0][1][i:i+1]
                     pred_1 = crop_preds[0][1]
@@ -437,6 +439,7 @@ def parse_opt():
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
     parser.add_argument('--sahi', type=str, choices=['none', 'crop', 'sahi'], default="none", help="use sahi inference, choices: none, crop, sahi")
+    parser.add_argument('--stack_frame', nargs='+', type=int, default=[0])
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')

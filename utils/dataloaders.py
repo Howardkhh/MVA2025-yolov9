@@ -114,7 +114,7 @@ def create_dataloader(path,
                       min_items=0,
                       prefix='',
                       shuffle=False,
-                      stack_frame=None):
+                      stack_frame=[0]):
     if rect and shuffle:
         LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
@@ -579,7 +579,7 @@ class LoadImagesAndLabels(Dataset):
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             irect = ar.argsort()
             self.im_files = [self.im_files[i] for i in irect]
-            self.im_files_stacked = [self.im_files_stacked[i] for i in irect]
+            self.im_files_stack = [self.im_files_stack[i] for i in irect]
             self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.segments = [self.segments[i] for i in irect]
@@ -694,6 +694,11 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
+        def load_img(im_file):
+            im = cv2.imread(im_file)  # BGR
+            assert im is not None, f'Image Not Found {im_file}'
+            return im
+
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
@@ -711,8 +716,15 @@ class LoadImagesAndLabels(Dataset):
             if self.sahi == "sahi":
                 num_crops = self.fi[index] # full image index, crop index
                 images, startends = [], []
+                im = Image.open(self.im_files_stack[index][0])
+                im.verify()  # PIL verify
+                w0, h0  = exif_size(im)  # image size
+                ims = ThreadPool(NUM_THREADS).imap(load_img, self.im_files_stack[index])
+                full_image = np.ndarray((h0, w0, len(self.im_files_stack[index]) * 3), dtype=np.uint8)
+                for i, im_slice in enumerate(ims):
+                    full_image[:, :, i*3:i*3 + 3] = im_slice
                 for i in range(num_crops):
-                    image, (h0, w0), _, startend = self.load_image(index, i)
+                    image, (h0, w0), _, startend = self.load_image(index, i, full_image)
                     images.append(image.transpose((2, 0, 1))[::-1])
                     startends.append(np.array(startend))
                 images = torch.from_numpy(np.ascontiguousarray(np.stack(images)))
@@ -782,7 +794,7 @@ class LoadImagesAndLabels(Dataset):
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB # Note that this also reverse the order of stack frame
         img = np.ascontiguousarray(img)
 
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
@@ -829,7 +841,7 @@ class LoadImagesAndLabels(Dataset):
         return np.array(mapped_labels)
 
 
-    def load_image(self, i, sahi_j=-1):
+    def load_image(self, i, sahi_j=-1, full_image=None):
         def load_crop(data):
             im_file, x_start, y_start = data
             im = cv2.imread(im_file)
@@ -850,19 +862,19 @@ class LoadImagesAndLabels(Dataset):
             im = Image.open(self.im_files_stack[i][0])
             im.verify()  # PIL verify
             w0, h0  = exif_size(im)  # image size
-            if self.sahi_crop or sahi_j != -1:
-                if self.sahi_crop:
-                    x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
-                    x_end, y_end = x_start + self.img_size, y_start + self.img_size
-                elif sahi_j != -1:
-                    x_start, x_end, y_start, y_end = self.get_crop_coordinates(*im.shape[:2], sahi_j)
+            if self.sahi_crop:
+                x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
+                x_end, y_end = x_start + self.img_size, y_start + self.img_size
                 ims = ThreadPool(NUM_THREADS).map(load_crop, [[im_file, x_start, y_start] for im_file in self.im_files_stack[i]])
                 # ims = [load_crop((im_file, x_start, y_start)) for im_file in self.im_files_stack[i]]
                 im = np.ndarray((self.img_size, self.img_size, len(self.im_files_stack[i]) * 3), dtype=np.uint8)
                 for i, im_slice in enumerate(ims):
                     im[:, :, i*3:i*3 + 3] = im_slice
                 return im, (h0, w0), im.shape[:2], ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized, cropped range in original image
-            
+            elif sahi_j != -1:
+                x_start, x_end, y_start, y_end = self.get_crop_coordinates(h0, w0, sahi_j)
+                return full_image[y_start:y_end, x_start:x_end], (h0, w0), (self.img_size, self.img_size), ((x_start, x_end), (y_start, y_end))  # im, hw_original, hw_resized
+
             ims = []
             for im_file in self.im_files_stack[i]:
                 im = cv2.imread(im_file)  # BGR
