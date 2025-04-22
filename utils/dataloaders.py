@@ -114,7 +114,8 @@ def create_dataloader(path,
                       min_items=0,
                       prefix='',
                       shuffle=False,
-                      stack_frame=[0]):
+                      stack_frame=[0],
+                      positive_sample_prob=0):
     if rect and shuffle:
         LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
@@ -137,7 +138,8 @@ def create_dataloader(path,
             image_weights=image_weights,
             min_items=min_items,
             prefix=prefix,
-            stack_frame=stack_frame)
+            stack_frame=stack_frame,
+            positive_sample_prob=positive_sample_prob)
 
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
@@ -454,7 +456,8 @@ class LoadImagesAndLabels(Dataset):
                  pad=0.0,
                  min_items=0,
                  prefix='',
-                 stack_frame=[0]):
+                 stack_frame=[0],
+                 positive_sample_prob=0):
         self.sahi = sahi
         self.sahi_crop = sahi=='crop' or (hyp is not None and hyp["sahi"])
         self.img_size = img_size
@@ -469,6 +472,7 @@ class LoadImagesAndLabels(Dataset):
         self.albumentations = Albumentations(size=img_size) if augment else None
         self.stack_frame = [0]
         self.stack_frame.extend([i for i in stack_frame if i != 0])
+        self.positive_sample_prob = positive_sample_prob
 
         try:
             f = []  # image files
@@ -740,13 +744,17 @@ class LoadImagesAndLabels(Dataset):
             else:
                 # Load image
 
-                img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+                labels = self.labels[index].copy()
+                if len(labels) > 0 and random.random() < self.positive_sample_prob:
+                    positive_box = random.choice(labels[:, 1:5])[None] # xywh
+                else:
+                    positive_box = None
+                img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index, positive_box=positive_box)
                 # Letterbox
                 shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
                 img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
                 shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
-                labels = self.labels[index].copy()
                 if self.sahi_crop:
                     labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
                 if labels.size:  # normalized xywh to pixel xyxy format
@@ -841,7 +849,7 @@ class LoadImagesAndLabels(Dataset):
         return np.array(mapped_labels)
 
 
-    def load_image(self, i, sahi_j=-1, full_image=None):
+    def load_image(self, i, sahi_j=-1, full_image=None, positive_box=None):
         def load_crop(data):
             im_file, x_start, y_start = data
             im = cv2.imread(im_file)
@@ -862,9 +870,20 @@ class LoadImagesAndLabels(Dataset):
             im = Image.open(self.im_files_stack[i][0])
             im.verify()  # PIL verify
             w0, h0  = exif_size(im)  # image size
-            if self.sahi_crop:
-                x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
-                x_end, y_end = x_start + self.img_size, y_start + self.img_size
+            if self.sahi_crop or sahi_j != -1:
+                if self.sahi_crop:
+                    if positive_box is not None:
+                        x1, y1, x2, y2 = xywhn2xyxy(positive_box, w0, h0)[0]
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                        border = 20
+                        if x1 < border or y1 < border or x2 > w0 - border or y2 > h0 - border:
+                            border = 0
+                        x_start, y_start = random.randint(max(0, min(w0, x2+border)-self.img_size), min(w0-self.img_size, x1-border)), random.randint(max(0, min(h0, y2+border)-self.img_size), min(h0-self.img_size, y1-border))
+                    else:
+                        x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
+                    x_end, y_end = x_start + self.img_size, y_start + self.img_size
+                elif sahi_j != -1:
+                    x_start, x_end, y_start, y_end = self.get_crop_coordinates(h0, w0, sahi_j)
                 ims = ThreadPool(NUM_THREADS).map(load_crop, [[im_file, x_start, y_start] for im_file in self.im_files_stack[i]])
                 # ims = [load_crop((im_file, x_start, y_start)) for im_file in self.im_files_stack[i]]
                 im = np.ndarray((self.img_size, self.img_size, len(self.im_files_stack[i]) * 3), dtype=np.uint8)
@@ -904,8 +923,13 @@ class LoadImagesAndLabels(Dataset):
         indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
         random.shuffle(indices)
         for i, index in enumerate(indices):
+            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if len(labels) > 0 and random.random() < self.positive_sample_prob:
+                positive_box = random.choice(labels[:, 1:5])[None]
+            else:
+                positive_box = None
             # Load image
-            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index)
+            img, (h0, w0), (h, w), (x_range, y_range) = self.load_image(index, positive_box=positive_box)
 
             # place img in img4
             if i == 0:  # top left
@@ -927,7 +951,6 @@ class LoadImagesAndLabels(Dataset):
             padh = y1a - y1b
 
             # Labels
-            labels, segments = self.labels[index].copy(), self.segments[index].copy()
             if self.sahi_crop:
                 labels = self.map_label_to_crop(labels, w0, h0, x_range, y_range)
             if labels.size:

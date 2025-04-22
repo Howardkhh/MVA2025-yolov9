@@ -202,7 +202,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               prefix=colorstr('train: '),
                                               shuffle=True,
                                               min_items=opt.min_items,
-                                              stack_frame=opt.stack_frame)
+                                              stack_frame=opt.stack_frame,
+                                              positive_sample_prob=opt.positive_sample_prob)
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
@@ -484,6 +485,7 @@ def parse_opt(known=False):
     parser.add_argument('--close-mosaic', type=int, default=0, help='Experimental')
     parser.add_argument('--use_nwd', type=str, default="none", choices=["none", "assigner", "loss", "all"], help="Use Normalized Wasserstein Distance")
     parser.add_argument('--stack_frame', nargs='+', type=int, default=[0])
+    parser.add_argument('--positive_sample_prob', type=float, default=0.8, help="probability of guaranteed positive sample in random cropping")
 
     # Logger arguments
     parser.add_argument('--entity', default=None, help='Entity')
