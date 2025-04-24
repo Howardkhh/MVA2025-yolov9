@@ -876,9 +876,12 @@ class LoadImagesAndLabels(Dataset):
                         x1, y1, x2, y2 = xywhn2xyxy(positive_box, w0, h0)[0]
                         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                         border = 20
-                        if x1 < border or y1 < border or x2 > w0 - border or y2 > h0 - border:
-                            border = 0
-                        x_start, y_start = random.randint(max(0, min(w0, x2+border)-self.img_size), min(w0-self.img_size, x1-border)), random.randint(max(0, min(h0, y2+border)-self.img_size), min(h0-self.img_size, y1-border))
+                        if x2 - x1 > self.img_size - border*2 or y2 - y1 > self.img_size - border*2:
+                             x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
+                        else:
+                            if x1 < border or y1 < border or x2 > w0 - border or y2 > h0 - border:
+                                border = 0
+                            x_start, y_start = random.randint(max(0, min(w0, x2+border)-self.img_size), min(w0-self.img_size, x1-border)), random.randint(max(0, min(h0, y2+border)-self.img_size), min(h0-self.img_size, y1-border))
                     else:
                         x_start, y_start = random.randint(0, w0 - self.img_size), random.randint(0, h0 - self.img_size)
                     x_end, y_end = x_start + self.img_size, y_start + self.img_size
