@@ -398,7 +398,7 @@ if __name__ == "__main__":
 
     if source == "COCO":
         convert_coco_json(
-            "../../MVA2025-SMOT4SB/OC_SORT/datasets/SMOT4SB/annotations/",  # directory with *.json
+            "../../OC_SORT/datasets/SMOT4SB/annotations/",  # directory with *.json
             use_segments=False,
             cls91to80=True,
         )

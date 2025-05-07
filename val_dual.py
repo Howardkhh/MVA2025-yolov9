@@ -191,7 +191,7 @@ def run(
     dt = Profile(), Profile(), Profile()  # profiling times
     loss = torch.zeros(3, device=device)
     jdict, jdict_no_nms, stats, ap, ap_class = [], [], [], [], []
-    ann_coco = COCO(str(Path(data.get('path', '../coco')) / f'annotations/{"pub_test" if task=="test" else task}.json'))
+    ann_coco = COCO(str(Path(data.get('path', '../coco')) / f'annotations/{"private_test" if task=="test" else task}.json'))
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s)  # progress bar
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
